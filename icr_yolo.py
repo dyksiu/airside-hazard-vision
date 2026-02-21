@@ -4,7 +4,7 @@ import csv
 import random
 import numpy as np
 from ultralytics import YOLO
-from tkinter import Tk, Label, Button, filedialog, Scale, HORIZONTAL, messagebox
+from tkinter import Tk, Label, Button, filedialog, Scale, HORIZONTAL, messagebox, Frame
 
 
 class YoloVideoApp:
@@ -19,13 +19,13 @@ class YoloVideoApp:
         self.line_model = None      # model linii
 
         # dane z analizy
-        self.class_confidences = {}   # "surface:class" lub "line:class" -> [conf...]
-        self.detections = []          # (frame_idx, model_type, class_name, conf)
+        self.class_confidences = {}
+        self.detections = []
 
-        # domyślny język
+        # domyslny jezyk
         self.lang = "pl"
 
-        # stała rozdzielczość podglądu/przetwarzania
+        # stala rozdzielczosc
         self.TARGET_WIDTH = 960
         self.TARGET_HEIGHT = 540
 
@@ -127,23 +127,48 @@ class YoloVideoApp:
         self.model_label = Label(window, text=self.tr("select_model"))
         self.model_label.pack(pady=10)
 
-        self.surface_model_button = Button(window, text=self.tr("surface_model"), command=self.select_surface_model)
+
+        models_row = Frame(window)
+        models_row.pack(pady=5)
+
+
+        surface_col = Frame(models_row)
+        surface_col.pack(side="left", padx=15)
+
+        self.surface_model_button = Button(surface_col, text=self.tr("surface_model"),
+                                           command=self.select_surface_model)
         self.surface_model_button.pack(pady=5)
 
-        self.surface_model_name_label = Label(window, text=f"{self.tr('current_surface_model')}{self.tr('no_model')}", fg="gray")
+        self.surface_model_name_label = Label(
+            surface_col,
+            text=f"{self.tr('current_surface_model')}{self.tr('no_model')}",
+            fg="gray",
+            wraplength=200,
+            justify="left"
+        )
         self.surface_model_name_label.pack()
 
-        self.surface_model_reset_button = Button(window, text="Reset", command=self.reset_surface_model)
-        self.surface_model_reset_button.pack(pady=2)
 
-        self.line_model_button = Button(window, text=self.tr("line_model"), command=self.select_line_model)
+        line_col = Frame(models_row)
+        line_col.pack(side="left", padx=15)
+
+        self.line_model_button = Button(line_col, text=self.tr("line_model"), command=self.select_line_model)
         self.line_model_button.pack(pady=5)
 
-        self.line_model_name_label = Label(window, text=f"{self.tr('current_line_model')}{self.tr('no_model')}", fg="gray")
+        self.line_model_name_label = Label(
+            line_col,
+            text=f"{self.tr('current_line_model')}{self.tr('no_model')}",
+            fg="gray",
+            wraplength=200,
+            justify="left"
+        )
         self.line_model_name_label.pack()
 
-        self.line_model_reset_button = Button(window, text="Reset", command=self.reset_line_model)
-        self.line_model_reset_button.pack(pady=2)
+
+        sep1 = Frame(window, bg="black", height=2, width=420)
+        sep1.pack(pady=12)
+        sep1.pack_propagate(False)
+
 
         self.video_label = Label(window, text=self.tr("select_video_conf"))
         self.video_label.pack(pady=10)
@@ -158,13 +183,19 @@ class YoloVideoApp:
         self.video_button = Button(window, text=self.tr("choose_video"), command=self.select_video)
         self.video_button.pack(pady=10)
 
+
+        sep2 = Frame(window, bg="black", height=2, width=420)
+        sep2.pack(pady=12)
+        sep2.pack_propagate(False)
+
+
         self.save_csv_button = Button(window, text=self.tr("save_csv"), command=self.save_csv)
         self.save_csv_button.pack(pady=10)
 
         self.lang_button = Button(window, text=self.tr("lang_toggle"), command=self.toggle_language)
         self.lang_button.pack(pady=5)
 
-    # ---- helpers ----
+
     def tr(self, key):
         return self.translations[self.lang].get(key, key)
 
@@ -212,7 +243,7 @@ class YoloVideoApp:
     def update_conf_label(self, val):
         self.conf_label.config(text=f"{self.tr('confidence')}: {int(val) / 100:.2f}")
 
-    # ---- model selection ----
+
     def select_surface_model(self):
         model_path = filedialog.askopenfilename(filetypes=[("YOLO model files", "*.pt")])
         if model_path:
@@ -250,7 +281,7 @@ class YoloVideoApp:
         )
 
 
-    # ---- main video processing ----
+
     def select_video(self):
         if self.surface_model is None and self.line_model is None:
             messagebox.showwarning(self.tr("no_model_title"), self.tr("no_model_msg"))
@@ -260,14 +291,14 @@ class YoloVideoApp:
         if not video_path:
             return
 
-        # reset danych
+
         self.class_confidences = {}
         self.detections = []
 
         conf_value = self.conf_slider.get() / 100
         cap = cv2.VideoCapture(video_path)
 
-        # frame skipping, gdy są dwa modele (dla płynności)
+
         process_stride = 2 if (self.surface_model is not None and self.line_model is not None) else 1
 
         last_frame_vis = None
@@ -281,7 +312,7 @@ class YoloVideoApp:
             frame = cv2.resize(frame, (self.TARGET_WIDTH, self.TARGET_HEIGHT))
             height, width = frame.shape[:2]
 
-            # frame skipping: pokazujemy poprzedni wynik
+
             if frame_count % process_stride != 0 and last_frame_vis is not None:
                 cv2.imshow("YOLOv8 Detection", last_frame_vis)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -291,7 +322,7 @@ class YoloVideoApp:
 
             frame_vis = frame.copy()
 
-            # ===== 1) MODEL NAWIERZCHNI (NIEZALEŻNY) =====
+            # 1) model nawierzchni
             if self.surface_model is not None:
                 overlay_surface = frame_vis.copy()
                 results_surface = self.surface_model(frame, conf=conf_value, device=0)
@@ -299,7 +330,7 @@ class YoloVideoApp:
                 for r in results_surface:
                     if hasattr(r, "masks") and r.masks is not None and r.boxes is not None:
                         masks = r.masks.data.cpu().numpy()
-                        # dopasuj liczbę masek do liczby bboxów (czasem bywa różnie)
+
                         n = min(len(masks), len(r.boxes))
                         for idx in range(n):
                             mask = masks[idx]
@@ -331,7 +362,7 @@ class YoloVideoApp:
                                     cv2.putText(frame_vis, label, (cx, cy),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     else:
-                        # fallback: bbox (bez masek)
+
                         if r.boxes is None:
                             continue
                         for box in r.boxes:
@@ -354,9 +385,9 @@ class YoloVideoApp:
 
                 frame_vis = cv2.addWeighted(overlay_surface, 0.4, frame_vis, 0.6, 0)
 
-            # ===== 2) MODEL LINII (NIEZALEŻNY) =====
+            # 2) model linii
             if self.line_model is not None:
-                overlay_line = frame_vis.copy()  # nakładamy na aktualny widok (po nawierzchni, jeśli była)
+                overlay_line = frame_vis.copy()
                 results_line = self.line_model(frame, conf=conf_value, device=0)
 
                 for r in results_line:
@@ -364,8 +395,8 @@ class YoloVideoApp:
                         masks = r.masks.data.cpu().numpy()
                         n = min(len(masks), len(r.boxes))
 
-                        class_masks = {}      # cls_id -> combined_mask
-                        class_best_conf = {}  # cls_id -> max conf
+                        class_masks = {}
+                        class_best_conf = {}
 
                         for idx in range(n):
                             mask = masks[idx]
@@ -411,7 +442,6 @@ class YoloVideoApp:
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                     else:
-                        # fallback: bbox (bez masek)
                         if r.boxes is None:
                             continue
                         for box in r.boxes:
@@ -434,7 +464,7 @@ class YoloVideoApp:
 
                 frame_vis = cv2.addWeighted(overlay_line, 0.4, frame_vis, 0.6, 0)
 
-            # zapamiętaj wynik (do frame skipping)
+            # zapamietaj ostatni wynik
             last_frame_vis = frame_vis.copy()
 
             cv2.imshow("YOLOv8 Detection", frame_vis)
@@ -447,7 +477,7 @@ class YoloVideoApp:
         cv2.destroyAllWindows()
         messagebox.showinfo(self.tr("done"), self.tr("done_msg"))
 
-    # ---- save csv ----
+
     def save_csv(self):
         if not self.class_confidences or not self.detections:
             messagebox.showwarning(self.tr("no_data"), self.tr("no_data_msg"))
