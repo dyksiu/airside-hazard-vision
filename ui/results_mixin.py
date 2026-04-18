@@ -79,18 +79,25 @@ class ResultsMixin:
         for item in self.results_tree.get_children():
             self.results_tree.delete(item)
 
-        stats, fc = self.copy_stats()
-        if not stats:
-            if self.results_info:
-                self.results_info.config(text=self.tr("no_stats"))
-            return
+        stats, _ = self.copy_stats()
+        fc, current_fps, avg_fps = self.copy_runtime_stats()
 
         total_det = sum(v["count"] for v in stats.values())
         if self.results_info:
-            self.results_info.config(
-                text=f"Klatka: {fc} | Wykrycia: {total_det}" if self.lang == "pl"
-                else f"Frame: {fc} | Detections: {total_det}"
-            )
+            if self.lang == "pl":
+                info_text = (
+                    f"Klatka: {fc} | Wykrycia: {total_det} | "
+                    f"{self.tr('fps_current')}: {current_fps:.1f} | {self.tr('fps_average')}: {avg_fps:.1f}"
+                )
+            else:
+                info_text = (
+                    f"Frame: {fc} | Detections: {total_det} | "
+                    f"{self.tr('fps_current')}: {current_fps:.1f} | {self.tr('fps_average')}: {avg_fps:.1f}"
+                )
+            self.results_info.config(text=info_text)
+
+        if not stats:
+            return
 
         rows = []
         for key, st in stats.items():

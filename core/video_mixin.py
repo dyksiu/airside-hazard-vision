@@ -8,6 +8,47 @@ from tkinter import filedialog, messagebox
 
 class VideoMixin:
 
+    def reset_fps_stats(self):
+        with self.stats_lock:
+            self.frame_count = 0
+            self.current_fps = 0.0
+            self.avg_fps = 0.0
+
+    def copy_runtime_stats(self):
+        with self.stats_lock:
+            return self.frame_count, self.current_fps, self.avg_fps
+
+    def draw_fps_overlay(self, frame, current_fps, avg_fps):
+        lines = [
+            f"{self.tr('fps_current')}: {current_fps:.1f}",
+            f"{self.tr('fps_average')}: {avg_fps:.1f}",
+        ]
+
+        x = 12
+        y = 28
+        line_h = 26
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+
+        max_w = 0
+        for line in lines:
+            (tw, th), _ = cv2.getTextSize(line, font, font_scale, thickness)
+            max_w = max(max_w, tw)
+
+        box_w = max_w + 20
+        box_h = line_h * len(lines) + 12
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x - 8, y - 22), (x - 8 + box_w, y - 22 + box_h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+
+        for idx, line in enumerate(lines):
+            yy = y + idx * line_h
+            cv2.putText(frame, line, (x, yy), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.putText(frame, line, (x, yy), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        return frame
+
     def select_video(self):
         if (not self.surface_ready()) and (not self.line_ready()):
             messagebox.showwarning(self.tr("no_model_title"), self.tr("no_model_msg"))
@@ -17,16 +58,8 @@ class VideoMixin:
         if not video_path:
             return
 
-        self.stop_processing(silent=True)
-
-        with self.stats_lock:
-            self.class_confidences = {}
-            self.detections = []
-            self.class_stats = {}
-            self.frame_count = 0
-
-        self.reset_tracking()
-        self.last_surface_roi = None
+        self.clear_video(silent=True)
+        self.reset_fps_stats()
 
         self.conf_value = self.conf_slider.get() / 100
         self.process_stride = 2 if (self.surface_ready() and self.line_ready()) else 1
@@ -50,6 +83,37 @@ class VideoMixin:
         self.worker_thread.start()
         self.schedule_display_loop()
 
+    def clear_video(self, silent=False):
+        self.stop_processing(silent=True)
+
+        with self.stats_lock:
+            self.class_confidences = {}
+            self.detections = []
+            self.class_stats = {}
+
+        self.reset_fps_stats()
+
+        self.reset_tracking()
+        self.reset_event_log_state()
+        self.last_surface_roi = None
+        self.worker_done = False
+        self.worker_error = None
+
+        try:
+            while True:
+                self.frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        self._tkimg = None
+        self.video_panel.config(image="", text=self.tr("video_placeholder"))
+
+        if self.results_win is not None and self.results_win.winfo_exists():
+            self.update_results_window()
+
+        if self.hist_win is not None and self.hist_win.winfo_exists():
+            self.update_histogram()
+
     def schedule_display_loop(self):
         if self.display_job is not None:
             try:
@@ -69,7 +133,10 @@ class VideoMixin:
         except queue.Empty:
             pass
 
+        self.drain_event_log_queue()
+
         if self.worker_done:
+            self.drain_event_log_queue()
             self.running = False
             self.pause_button.config(state="disabled", text=self.tr("pause"))
             if self.worker_error:
@@ -95,11 +162,13 @@ class VideoMixin:
 
             last_annotated = None
             frame_idx = 0
-            t0 = time.time()
+            fps_started_at = time.perf_counter()
 
             while not self.stop_event.is_set():
                 while self.pause_event.is_set() and not self.stop_event.is_set():
                     time.sleep(0.05)
+
+                loop_started_at = time.perf_counter()
 
                 ret, frame = cap.read()
                 if not ret:
@@ -112,10 +181,26 @@ class VideoMixin:
                     frame_vis = self.run_detection_on_frame(frame, frame_idx)
                     last_annotated = frame_vis
                 else:
-                    frame_vis = last_annotated if last_annotated is not None else frame
+                    frame_vis = last_annotated.copy() if last_annotated is not None else frame
+
+                work_dt = time.perf_counter() - loop_started_at
+                sleep = frame_time - work_dt
+                if sleep > 0:
+                    time.sleep(sleep)
+
+                loop_dt = max(time.perf_counter() - loop_started_at, 1e-6)
+                instant_fps = 1.0 / loop_dt
+                elapsed_total = max(time.perf_counter() - fps_started_at, 1e-6)
+                avg_fps = (frame_idx + 1) / elapsed_total
 
                 with self.stats_lock:
+                    prev_fps = float(getattr(self, 'current_fps', 0.0) or 0.0)
                     self.frame_count = frame_idx
+                    self.current_fps = instant_fps if prev_fps <= 0 else (prev_fps * 0.8 + instant_fps * 0.2)
+                    self.avg_fps = avg_fps
+                    current_fps = self.current_fps
+
+                frame_vis = self.draw_fps_overlay(frame_vis, current_fps, avg_fps)
 
                 try:
                     while True:
@@ -124,11 +209,6 @@ class VideoMixin:
                     pass
                 self.frame_queue.put(frame_vis)
 
-                dt = time.time() - t0
-                sleep = frame_time - dt
-                if sleep > 0:
-                    time.sleep(sleep)
-                t0 = time.time()
                 frame_idx += 1
 
             cap.release()
@@ -154,7 +234,8 @@ class VideoMixin:
         self.worker_thread = None
 
         if not silent:
-            self.video_panel.config(image="", text="(Zatrzymano)")
+            self._tkimg = None
+            self.video_panel.config(image="", text=self.tr("video_stopped"))
 
         self.pause_event.clear()
         self.paused = False

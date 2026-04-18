@@ -13,6 +13,9 @@ def save_results_csv(
     line_unet_names,
     confidences_copy,
     detections_copy,
+    current_fps=0.0,
+    avg_fps=0.0,
+    event_log_copy=None,
 ):
     with open(save_path, mode="w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file, delimiter=";")
@@ -38,6 +41,12 @@ def save_results_csv(
                 writer.writerow([f"# line: {cls_id} = {line_unet_names.get(cls_id, str(cls_id))}"])
 
         writer.writerow([])
+        writer.writerow(["STATYSTYKI FPS"])
+        writer.writerow(["Metryka", "Wartosc"])
+        writer.writerow(["Aktualne FPS", round(current_fps, 4)])
+        writer.writerow(["srednie FPS", round(avg_fps, 4)])
+
+        writer.writerow([])
         writer.writerow(["PODSUMOWANIE"])
         writer.writerow(["Typ modelu", "Klasa", "Średni confidence", "Liczba wykryć"])
 
@@ -52,3 +61,10 @@ def save_results_csv(
 
         for detection in detections_copy:
             writer.writerow(detection)
+
+        if event_log_copy:
+            writer.writerow([])
+            writer.writerow(["LOG ZDARZEŃ"])
+            writer.writerow(["Czas", "Typ zdarzenia", "Opis"])
+            for entry in event_log_copy:
+                writer.writerow(list(entry))
