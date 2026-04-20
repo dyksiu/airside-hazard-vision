@@ -1,6 +1,8 @@
 import os
+from pathlib import Path
 import cv2
 import random
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,9 +10,142 @@ from ultralytics import YOLO
 from tkinter import filedialog, messagebox
 
 from models.unet import UNet
+from core.hailo_runtime import HailoYOLOSegModel
 
 
 class DetectionMixin:
+
+    def _get_segformer_components(self):
+        try:
+            from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+        except ImportError as exc:
+            raise ImportError(
+                "Brakuje biblioteki transformers wymaganej do obsługi SegFormer. "
+                "Zainstaluj: pip install transformers"
+            ) from exc
+        return SegformerForSemanticSegmentation, SegformerImageProcessor
+
+    def _unwrap_loaded_state(self, state):
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        if isinstance(state, dict) and any(k.startswith("module.") for k in state.keys()):
+            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+        return state
+
+    def _infer_deeplab_model_name(self, state_dict):
+        keys = list(state_dict.keys())
+
+        # MobileNetV3 backbone in torchvision DeepLabV3 is wrapped by IntermediateLayerGetter,
+        # so keys are typically like: backbone.0.0.weight, backbone.1.block.0.0.weight, ...
+        if any(k.startswith("backbone.0.") for k in keys) or any(k.startswith("backbone.1.") for k in keys):
+            return "deeplabv3_mobilenet_v3_large"
+
+        # ResNet backbones keep names like backbone.conv1 / backbone.layer1 / backbone.layer2 / ...
+        if any(k.startswith("backbone.conv1") for k in keys) or any(k.startswith("backbone.layer") for k in keys):
+            if any(k.startswith("backbone.layer3.22") for k in keys):
+                return "deeplabv3_resnet101"
+            return "deeplabv3_resnet50"
+
+        # Fallback by ASPP input channels if key names were changed by save/export pipeline.
+        aspp_w = state_dict.get("classifier.0.convs.0.0.weight")
+        if isinstance(aspp_w, torch.Tensor) and aspp_w.ndim == 4:
+            in_channels = int(aspp_w.shape[1])
+            if in_channels == 960:
+                return "deeplabv3_mobilenet_v3_large"
+            if in_channels == 2048:
+                if any(k.startswith("backbone.layer3.22") for k in keys):
+                    return "deeplabv3_resnet101"
+                return "deeplabv3_resnet50"
+
+        raise ValueError("Nie udało się rozpoznać architektury DeepLabV3 z pliku wag.")
+
+    def _build_deeplabv3(self, num_classes: int, model_name: str):
+        if model_name == "deeplabv3_mobilenet_v3_large":
+            from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large
+            try:
+                return deeplabv3_mobilenet_v3_large(
+                    weights=None,
+                    weights_backbone=None,
+                    num_classes=num_classes,
+                    aux_loss=False,
+                )
+            except TypeError:
+                try:
+                    return deeplabv3_mobilenet_v3_large(
+                        pretrained=False,
+                        progress=True,
+                        num_classes=num_classes,
+                        aux_loss=False,
+                        pretrained_backbone=False,
+                    )
+                except TypeError:
+                    return deeplabv3_mobilenet_v3_large(
+                        pretrained=False,
+                        progress=True,
+                        num_classes=num_classes,
+                        aux_loss=False,
+                    )
+
+        if model_name == "deeplabv3_resnet101":
+            from torchvision.models.segmentation import deeplabv3_resnet101
+            try:
+                return deeplabv3_resnet101(
+                    weights=None,
+                    weights_backbone=None,
+                    num_classes=num_classes,
+                    aux_loss=False,
+                )
+            except TypeError:
+                try:
+                    return deeplabv3_resnet101(
+                        pretrained=False,
+                        progress=True,
+                        num_classes=num_classes,
+                        aux_loss=False,
+                        pretrained_backbone=False,
+                    )
+                except TypeError:
+                    return deeplabv3_resnet101(
+                        pretrained=False,
+                        progress=True,
+                        num_classes=num_classes,
+                        aux_loss=False,
+                    )
+
+        from torchvision.models.segmentation import deeplabv3_resnet50
+        try:
+            return deeplabv3_resnet50(
+                weights=None,
+                weights_backbone=None,
+                num_classes=num_classes,
+                aux_loss=False,
+            )
+        except TypeError:
+            try:
+                return deeplabv3_resnet50(
+                    pretrained=False,
+                    progress=True,
+                    num_classes=num_classes,
+                    aux_loss=False,
+                    pretrained_backbone=False,
+                )
+            except TypeError:
+                return deeplabv3_resnet50(
+                    pretrained=False,
+                    progress=True,
+                    num_classes=num_classes,
+                    aux_loss=False,
+                )
+
+    def _forward_segmentation_logits(self, model, x):
+        out = model(x)
+        if hasattr(out, "logits"):
+            return out.logits
+        if isinstance(out, dict):
+            return out.get("out", out.get("logits", out))
+        return out
 
     def get_class_color(self, cls_id):
         random.seed(cls_id)
@@ -25,6 +160,19 @@ class DetectionMixin:
             return (0, 0, 255)
         return (0, 255, 0)
 
+    def get_surface_color_by_name(self, class_name, cls_id=None):
+        normalized = str(class_name).strip().lower()
+        if normalized in {"beton", "concrete"}:
+            return (0, 0, 255)
+        if normalized in {"asfalt", "asphalt"}:
+            return (0, 255, 0)
+        if normalized in {"kostka", "paving stones", "paving_stones", "kostka brukowa"}:
+            return (255, 0, 0)
+        if normalized in {"trawa", "grass"}:
+            return (0, 255, 255)
+        fallback_id = int(cls_id) if cls_id is not None else abs(hash(normalized)) % 256
+        return self.get_class_color(fallback_id)
+
     def load_line_unet_weights(self, weights_path: str):
         model = UNet(
             in_channels=3,
@@ -33,10 +181,7 @@ class DetectionMixin:
         ).to(self.line_unet_device)
 
         state = torch.load(weights_path, map_location=self.line_unet_device)
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        if isinstance(state, dict) and any(k.startswith("module.") for k in state.keys()):
-            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+        state = self._unwrap_loaded_state(state)
 
         model.load_state_dict(state)
         model.eval()
@@ -52,16 +197,130 @@ class DetectionMixin:
         ).to(self.unet_device)
 
         state = torch.load(weights_path, map_location=self.unet_device)
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        if isinstance(state, dict) and any(k.startswith("module.") for k in state.keys()):
-            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+        state = self._unwrap_loaded_state(state)
 
         model.load_state_dict(state)
         model.eval()
 
         self.unet_model = model
         self.surface_unet_name = os.path.basename(weights_path)
+
+    def load_line_deeplab_weights(self, weights_path: str):
+        state = torch.load(weights_path, map_location=self.line_deeplab_device)
+        state = self._unwrap_loaded_state(state)
+        model_name = self._infer_deeplab_model_name(state)
+
+        model = self._build_deeplabv3(self.line_deeplab_num_classes, model_name).to(self.line_deeplab_device)
+        model.load_state_dict(state)
+        model.eval()
+
+        self.line_deeplab_model = model
+        self.line_deeplab_name = os.path.basename(weights_path)
+        self.line_deeplab_arch = model_name
+
+    def load_surface_deeplab_weights(self, weights_path: str):
+        state = torch.load(weights_path, map_location=self.deeplab_device)
+        state = self._unwrap_loaded_state(state)
+        model_name = self._infer_deeplab_model_name(state)
+
+        model = self._build_deeplabv3(self.deeplab_num_classes, model_name).to(self.deeplab_device)
+        model.load_state_dict(state)
+        model.eval()
+
+        self.surface_deeplab_model = model
+        self.surface_deeplab_name = os.path.basename(weights_path)
+        self.surface_deeplab_arch = model_name
+
+
+    def _extract_segformer_label_info(self, model, fallback_num_classes, fallback_names):
+        num_labels = int(getattr(model.config, "num_labels", fallback_num_classes))
+        id2label = getattr(model.config, "id2label", None) or {}
+        names = {}
+        for idx in range(num_labels):
+            label = id2label.get(idx, id2label.get(str(idx), fallback_names.get(idx, str(idx))))
+            names[idx] = str(label)
+        return num_labels, names
+
+    def load_surface_segformer_model(self, model_dir: str):
+        SegformerForSemanticSegmentation, SegformerImageProcessor = self._get_segformer_components()
+        processor = SegformerImageProcessor.from_pretrained(model_dir)
+        model = SegformerForSemanticSegmentation.from_pretrained(model_dir).to(self.segformer_device)
+        model.eval()
+
+        self.surface_segformer_model = model
+        self.surface_segformer_processor = processor
+        self.surface_segformer_name = os.path.basename(os.path.normpath(model_dir))
+        self.segformer_num_classes, self.segformer_names = self._extract_segformer_label_info(
+            model,
+            self.segformer_num_classes,
+            self.segformer_names,
+        )
+
+    def load_line_segformer_model(self, model_dir: str):
+        SegformerForSemanticSegmentation, SegformerImageProcessor = self._get_segformer_components()
+        processor = SegformerImageProcessor.from_pretrained(model_dir)
+        model = SegformerForSemanticSegmentation.from_pretrained(model_dir).to(self.line_segformer_device)
+        model.eval()
+
+        self.line_segformer_model = model
+        self.line_segformer_processor = processor
+        self.line_segformer_name = os.path.basename(os.path.normpath(model_dir))
+        self.line_segformer_num_classes, self.line_segformer_names = self._extract_segformer_label_info(
+            model,
+            self.line_segformer_num_classes,
+            self.line_segformer_names,
+        )
+
+
+
+    def _default_hailo_labels(self, role: str):
+        if role == "line":
+            return [self.line_unet_names[k] for k in sorted(self.line_unet_names)]
+        return [self.unet_names[k] for k in sorted(self.unet_names)]
+
+    def _find_hailo_labels_path(self, hef_path: str):
+        path = Path(hef_path)
+        candidates = [
+            path.with_suffix(".labels.txt"),
+            path.with_suffix(".labels"),
+            path.with_suffix(".txt"),
+            path.parent / "labels.txt",
+        ]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+        return None
+
+    def load_surface_hailo_model(self, hef_path: str):
+        os.environ.setdefault("HAILO_MONITOR", "1")
+        labels_path = self._find_hailo_labels_path(hef_path)
+        labels = labels_path or self._default_hailo_labels("surface")
+        model = HailoYOLOSegModel(
+            hef_path,
+            labels=labels,
+            default_labels=self._default_hailo_labels("surface"),
+        )
+        self.surface_hailo_model = model
+        self.surface_hailo_name = os.path.basename(hef_path)
+
+    def load_line_hailo_model(self, hef_path: str):
+        os.environ.setdefault("HAILO_MONITOR", "1")
+        labels_path = self._find_hailo_labels_path(hef_path)
+        labels = labels_path or self._default_hailo_labels("line")
+        model = HailoYOLOSegModel(
+            hef_path,
+            labels=labels,
+            default_labels=self._default_hailo_labels("line"),
+        )
+        self.line_hailo_model = model
+        self.line_hailo_name = os.path.basename(hef_path)
+
+    def _merge_hailo_model_profile(self, model):
+        if model is None:
+            return
+        profile = getattr(model, "last_profile_ms", None) or {}
+        for key, value in profile.items():
+            self._add_profile_frame_ms(key, value)
 
     def select_surface_model(self):
         backend = self.surface_backend_var.get()
@@ -80,14 +339,59 @@ class DetectionMixin:
                     messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
             return
 
-        weights_path = filedialog.askopenfilename(filetypes=[("U-Net weights", "*.pth")])
+        if backend == "HAILO":
+            model_path = filedialog.askopenfilename(filetypes=[("Hailo model files", "*.hef")])
+            if model_path:
+                try:
+                    self.load_surface_hailo_model(model_path)
+                    self.on_surface_backend_changed()
+                    messagebox.showinfo(
+                        self.tr("model_loaded"),
+                        self.tr("model_loaded_msg").format(self.surface_hailo_name)
+                    )
+                except Exception as e:
+                    messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
+            return
+
+        if backend == "UNET":
+            weights_path = filedialog.askopenfilename(filetypes=[("U-Net weights", "*.pth *.pt"), ("PyTorch weights", "*.pth *.pt")])
+            if weights_path:
+                try:
+                    self.load_unet_weights(weights_path)
+                    self.on_surface_backend_changed()
+                    messagebox.showinfo(
+                        self.tr("model_loaded"),
+                        self.tr("model_loaded_msg").format(self.surface_unet_name)
+                    )
+                except Exception as e:
+                    messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
+            return
+
+        if backend == "SEGFORMER":
+            model_dir = filedialog.askdirectory(title="Wybierz katalog modelu SegFormer")
+            if model_dir:
+                try:
+                    self.load_surface_segformer_model(model_dir)
+                    self.on_surface_backend_changed()
+                    messagebox.showinfo(
+                        self.tr("model_loaded"),
+                        self.tr("model_loaded_msg").format(self.surface_segformer_name)
+                    )
+                except Exception as e:
+                    messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
+            return
+
+        weights_path = filedialog.askopenfilename(filetypes=[("DeepLabV3 weights", "*.pt *.pth"), ("PyTorch weights", "*.pt *.pth")])
         if weights_path:
             try:
-                self.load_unet_weights(weights_path)
+                self.load_surface_deeplab_weights(weights_path)
                 self.on_surface_backend_changed()
+                loaded_name = self.surface_deeplab_name
+                if self.surface_deeplab_arch:
+                    loaded_name = f"{loaded_name} ({self.surface_deeplab_arch})"
                 messagebox.showinfo(
                     self.tr("model_loaded"),
-                    self.tr("model_loaded_msg").format(self.surface_unet_name)
+                    self.tr("model_loaded_msg").format(loaded_name)
                 )
             except Exception as e:
                 messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
@@ -109,14 +413,59 @@ class DetectionMixin:
                     messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
             return
 
-        weights_path = filedialog.askopenfilename(filetypes=[("U-Net weights", "*.pth")])
+        if backend == "HAILO":
+            model_path = filedialog.askopenfilename(filetypes=[("Hailo model files", "*.hef")])
+            if model_path:
+                try:
+                    self.load_line_hailo_model(model_path)
+                    self.on_line_backend_changed()
+                    messagebox.showinfo(
+                        self.tr("model_loaded"),
+                        self.tr("model_loaded_msg").format(self.line_hailo_name)
+                    )
+                except Exception as e:
+                    messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
+            return
+
+        if backend == "UNET":
+            weights_path = filedialog.askopenfilename(filetypes=[("U-Net weights", "*.pth *.pt"), ("PyTorch weights", "*.pth *.pt")])
+            if weights_path:
+                try:
+                    self.load_line_unet_weights(weights_path)
+                    self.on_line_backend_changed()
+                    messagebox.showinfo(
+                        self.tr("model_loaded"),
+                        self.tr("model_loaded_msg").format(self.line_unet_name)
+                    )
+                except Exception as e:
+                    messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
+            return
+
+        if backend == "SEGFORMER":
+            model_dir = filedialog.askdirectory(title="Wybierz katalog modelu SegFormer")
+            if model_dir:
+                try:
+                    self.load_line_segformer_model(model_dir)
+                    self.on_line_backend_changed()
+                    messagebox.showinfo(
+                        self.tr("model_loaded"),
+                        self.tr("model_loaded_msg").format(self.line_segformer_name)
+                    )
+                except Exception as e:
+                    messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
+            return
+
+        weights_path = filedialog.askopenfilename(filetypes=[("DeepLabV3 weights", "*.pt *.pth"), ("PyTorch weights", "*.pt *.pth")])
         if weights_path:
             try:
-                self.load_line_unet_weights(weights_path)
+                self.load_line_deeplab_weights(weights_path)
                 self.on_line_backend_changed()
+                loaded_name = self.line_deeplab_name
+                if self.line_deeplab_arch:
+                    loaded_name = f"{loaded_name} ({self.line_deeplab_arch})"
                 messagebox.showinfo(
                     self.tr("model_loaded"),
-                    self.tr("model_loaded_msg").format(self.line_unet_name)
+                    self.tr("model_loaded_msg").format(loaded_name)
                 )
             except Exception as e:
                 messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
@@ -133,11 +482,32 @@ class DetectionMixin:
                 cleared_name = self.surface_yolo_name or self.tr("no_model")
                 self.surface_model = None
                 self.surface_yolo_name = None
-        else:
+        elif backend == "HAILO":
+            if self.surface_hailo_model is not None:
+                cleared_name = self.surface_hailo_name or self.tr("no_model")
+                try:
+                    self.surface_hailo_model.close()
+                except Exception:
+                    pass
+                self.surface_hailo_model = None
+                self.surface_hailo_name = None
+        elif backend == "UNET":
             if self.unet_model is not None:
                 cleared_name = self.surface_unet_name or self.tr("no_model")
                 self.unet_model = None
                 self.surface_unet_name = None
+        elif backend == "DEEPLABV3":
+            if self.surface_deeplab_model is not None:
+                cleared_name = self.surface_deeplab_name or self.tr("no_model")
+                self.surface_deeplab_model = None
+                self.surface_deeplab_name = None
+                self.surface_deeplab_arch = None
+        else:
+            if self.surface_segformer_model is not None:
+                cleared_name = self.surface_segformer_name or self.tr("no_model")
+                self.surface_segformer_model = None
+                self.surface_segformer_processor = None
+                self.surface_segformer_name = None
 
         self.last_surface_roi = None
 
@@ -164,11 +534,32 @@ class DetectionMixin:
                 cleared_name = self.line_yolo_name or self.tr("no_model")
                 self.line_model = None
                 self.line_yolo_name = None
-        else:
+        elif backend == "HAILO":
+            if self.line_hailo_model is not None:
+                cleared_name = self.line_hailo_name or self.tr("no_model")
+                try:
+                    self.line_hailo_model.close()
+                except Exception:
+                    pass
+                self.line_hailo_model = None
+                self.line_hailo_name = None
+        elif backend == "UNET":
             if self.line_unet_model is not None:
                 cleared_name = self.line_unet_name or self.tr("no_model")
                 self.line_unet_model = None
                 self.line_unet_name = None
+        elif backend == "DEEPLABV3":
+            if self.line_deeplab_model is not None:
+                cleared_name = self.line_deeplab_name or self.tr("no_model")
+                self.line_deeplab_model = None
+                self.line_deeplab_name = None
+                self.line_deeplab_arch = None
+        else:
+            if self.line_segformer_model is not None:
+                cleared_name = self.line_segformer_name or self.tr("no_model")
+                self.line_segformer_model = None
+                self.line_segformer_processor = None
+                self.line_segformer_name = None
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -181,32 +572,36 @@ class DetectionMixin:
                 self.tr("model_cleared_msg").format(cleared_name)
             )
 
-    def run_unet_line_on_frame(
-        self,
-        frame_infer_bgr,
-        frame_draw_bgr,
-        frame_idx,
-        surface_roi_mask=None,
-        analysis_roi_mask=None
-    ):
-        if self.line_unet_model is None:
-            return frame_draw_bgr
-
-        h, w = frame_draw_bgr.shape[:2]
-        overlay_line = frame_draw_bgr.copy()
-
+    def _predict_segmentation(self, model, device, img_size, frame_infer_bgr, image_processor=None):
+        h, w = frame_infer_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_infer_bgr, cv2.COLOR_BGR2RGB)
+
+        if image_processor is not None:
+            enc = image_processor(images=rgb, return_tensors="pt")
+            x = enc["pixel_values"].to(device, non_blocking=True)
+
+            with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                outputs = model(pixel_values=x)
+                logits = outputs.logits
+                logits = F.interpolate(logits, size=(h, w), mode="bilinear", align_corners=False)
+                probs = F.softmax(logits, dim=1)
+                conf, pred = torch.max(probs, dim=1)
+
+            pred = pred.squeeze(0).to("cpu").numpy().astype(np.uint8)
+            conf = conf.squeeze(0).to("cpu").numpy().astype(np.float32)
+            return pred, conf
+
         inp = cv2.resize(
             rgb,
-            (self.line_unet_img_size, self.line_unet_img_size),
+            (img_size, img_size),
             interpolation=cv2.INTER_LINEAR
         )
 
         x = torch.from_numpy(inp).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-        x = x.to(self.line_unet_device, non_blocking=True)
+        x = x.to(device, non_blocking=True)
 
-        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(self.line_unet_device.type == "cuda")):
-            logits = self.line_unet_model(x)
+        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            logits = self._forward_segmentation_logits(model, x)
             probs = F.softmax(logits, dim=1)
             conf, pred = torch.max(probs, dim=1)
 
@@ -215,6 +610,28 @@ class DetectionMixin:
 
         pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_NEAREST)
         conf = cv2.resize(conf, (w, h), interpolation=cv2.INTER_LINEAR)
+        return pred, conf
+
+    def _run_line_segmentation_on_frame(
+        self,
+        model,
+        device,
+        img_size,
+        num_classes,
+        class_names,
+        min_area,
+        frame_infer_bgr,
+        frame_draw_bgr,
+        frame_idx,
+        surface_roi_mask=None,
+        analysis_roi_mask=None,
+        image_processor=None,
+    ):
+        if model is None:
+            return frame_draw_bgr
+
+        overlay_line = frame_draw_bgr.copy()
+        pred, conf = self._predict_segmentation(model, device, img_size, frame_infer_bgr, image_processor=image_processor)
 
         valid = (pred > 0) & (conf >= self.conf_value)
         if analysis_roi_mask is not None:
@@ -227,8 +644,8 @@ class DetectionMixin:
             roi_dilated = cv2.dilate(roi, np.ones((k, k), np.uint8), iterations=1)
             valid = valid & roi_dilated.astype(bool)
 
-        for cls_id in range(1, self.line_unet_num_classes):
-            class_name = self.line_unet_names.get(cls_id, str(cls_id))
+        for cls_id in range(1, num_classes):
+            class_name = class_names.get(cls_id, str(cls_id))
             color = self.get_line_color_by_name(class_name)
             cls_mask = valid & (pred == cls_id)
             if not cls_mask.any():
@@ -238,8 +655,8 @@ class DetectionMixin:
 
         frame_draw_bgr = cv2.addWeighted(overlay_line, 0.4, frame_draw_bgr, 0.6, 0)
 
-        for cls_id in range(1, self.line_unet_num_classes):
-            class_name = self.line_unet_names.get(cls_id, str(cls_id))
+        for cls_id in range(1, num_classes):
+            class_name = class_names.get(cls_id, str(cls_id))
             color = self.get_line_color_by_name(class_name)
 
             cls_mask = ((pred == cls_id) & (conf >= self.conf_value))
@@ -262,7 +679,7 @@ class DetectionMixin:
                     best_area = area
                     best_cid = cid
 
-            if best_cid is None or best_area < self.line_unet_min_area:
+            if best_cid is None or best_area < min_area:
                 continue
 
             region = (labels == best_cid)
@@ -279,6 +696,7 @@ class DetectionMixin:
                 x, y, w_box, h_box = cv2.boundingRect(biggest)
                 bbox = (x, y, x + w_box, y + h_box)
                 self.register_confirmed_candidate(frame_idx, "line", class_name, region_conf, bbox)
+                self.observe_line_candidate(class_name)
 
             cx, cy = centroids[best_cid]
             translated_name = self.translate_class_name(class_name)
@@ -294,35 +712,27 @@ class DetectionMixin:
             )
 
         return frame_draw_bgr
-	
-    def run_unet_surface_on_frame(self, frame_infer_bgr, frame_draw_bgr, frame_idx, analysis_roi_mask=None):
-        if self.unet_model is None:
+
+    def _run_surface_segmentation_on_frame(
+        self,
+        model,
+        device,
+        img_size,
+        num_classes,
+        class_names,
+        min_area,
+        frame_infer_bgr,
+        frame_draw_bgr,
+        frame_idx,
+        analysis_roi_mask=None,
+        image_processor=None,
+    ):
+        if model is None:
             self.last_surface_roi = None
             return frame_draw_bgr
 
-        h, w = frame_draw_bgr.shape[:2]
         overlay_surface = frame_draw_bgr.copy()
-
-        rgb = cv2.cvtColor(frame_infer_bgr, cv2.COLOR_BGR2RGB)
-        inp = cv2.resize(
-            rgb,
-            (self.unet_img_size, self.unet_img_size),
-            interpolation=cv2.INTER_LINEAR
-        )
-
-        x = torch.from_numpy(inp).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-        x = x.to(self.unet_device, non_blocking=True)
-
-        with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(self.unet_device.type == "cuda")):
-            logits = self.unet_model(x)
-            probs = F.softmax(logits, dim=1)
-            conf, pred = torch.max(probs, dim=1)
-
-        pred = pred.squeeze(0).to("cpu").numpy().astype(np.uint8)
-        conf = conf.squeeze(0).to("cpu").numpy().astype(np.float32)
-
-        pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_NEAREST)
-        conf = cv2.resize(conf, (w, h), interpolation=cv2.INTER_LINEAR)
+        pred, conf = self._predict_segmentation(model, device, img_size, frame_infer_bgr, image_processor=image_processor)
 
         valid = (pred > 0) & (conf >= self.conf_value)
         if analysis_roi_mask is not None:
@@ -331,11 +741,17 @@ class DetectionMixin:
         roi = valid.astype(np.uint8)
         self.last_surface_roi = roi if roi.any() else None
 
-        color_mask = self.unet_colors_bgr[pred]
-        overlay_surface[valid] = color_mask[valid]
+        for cls_id in range(1, num_classes):
+            class_name = class_names.get(cls_id, str(cls_id))
+            color = self.get_surface_color_by_name(class_name, cls_id)
+            cls_mask_overlay = valid & (pred == cls_id)
+            if not cls_mask_overlay.any():
+                continue
+            for c in range(3):
+                overlay_surface[:, :, c][cls_mask_overlay] = color[c]
         frame_draw_bgr = cv2.addWeighted(overlay_surface, 0.4, frame_draw_bgr, 0.6, 0)
 
-        for cls_id in range(1, self.unet_num_classes):
+        for cls_id in range(1, num_classes):
             cls_mask = ((pred == cls_id) & (conf >= self.conf_value))
             if analysis_roi_mask is not None:
                 cls_mask = cls_mask & analysis_roi_mask.astype(bool)
@@ -348,7 +764,7 @@ class DetectionMixin:
 
             for cid in range(1, num):
                 area = int(stats[cid, cv2.CC_STAT_AREA])
-                if area < self.unet_min_area:
+                if area < min_area:
                     continue
 
                 region = (labels == cid)
@@ -356,11 +772,12 @@ class DetectionMixin:
                 if region_conf < self.conf_value:
                     continue
 
+                class_name = class_names.get(cls_id, str(cls_id))
+                color = self.get_surface_color_by_name(class_name, cls_id)
+                self.observe_surface_candidate(class_name, area)
+
                 reg_mask = (region.astype(np.uint8) * 255)
                 contours, _ = cv2.findContours(reg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                color = tuple(int(c) for c in self.unet_colors_bgr[cls_id])
-                class_name = self.unet_names.get(cls_id, str(cls_id))
 
                 if contours:
                     cv2.drawContours(frame_draw_bgr, contours, -1, color, 2)
@@ -381,10 +798,279 @@ class DetectionMixin:
                     color,
                     2
                 )
+                self._add_profile_frame_ms("hailo_label_draw_ms", (time.perf_counter() - t_label) * 1000.0)
 
         return frame_draw_bgr
 
+    def run_unet_line_on_frame(
+        self,
+        frame_infer_bgr,
+        frame_draw_bgr,
+        frame_idx,
+        surface_roi_mask=None,
+        analysis_roi_mask=None
+    ):
+        return self._run_line_segmentation_on_frame(
+            model=self.line_unet_model,
+            device=self.line_unet_device,
+            img_size=self.line_unet_img_size,
+            num_classes=self.line_unet_num_classes,
+            class_names=self.line_unet_names,
+            min_area=self.line_unet_min_area,
+            frame_infer_bgr=frame_infer_bgr,
+            frame_draw_bgr=frame_draw_bgr,
+            frame_idx=frame_idx,
+            surface_roi_mask=surface_roi_mask,
+            analysis_roi_mask=analysis_roi_mask,
+        )
+
+    def run_deeplab_line_on_frame(
+        self,
+        frame_infer_bgr,
+        frame_draw_bgr,
+        frame_idx,
+        surface_roi_mask=None,
+        analysis_roi_mask=None
+    ):
+        return self._run_line_segmentation_on_frame(
+            model=self.line_deeplab_model,
+            device=self.line_deeplab_device,
+            img_size=self.line_deeplab_img_size,
+            num_classes=self.line_deeplab_num_classes,
+            class_names=self.line_deeplab_names,
+            min_area=self.line_deeplab_min_area,
+            frame_infer_bgr=frame_infer_bgr,
+            frame_draw_bgr=frame_draw_bgr,
+            frame_idx=frame_idx,
+            surface_roi_mask=surface_roi_mask,
+            analysis_roi_mask=analysis_roi_mask,
+        )
+
+
+    def run_segformer_line_on_frame(
+        self,
+        frame_infer_bgr,
+        frame_draw_bgr,
+        frame_idx,
+        surface_roi_mask=None,
+        analysis_roi_mask=None
+    ):
+        return self._run_line_segmentation_on_frame(
+            model=self.line_segformer_model,
+            device=self.line_segformer_device,
+            img_size=0,
+            num_classes=self.line_segformer_num_classes,
+            class_names=self.line_segformer_names,
+            min_area=self.line_segformer_min_area,
+            frame_infer_bgr=frame_infer_bgr,
+            frame_draw_bgr=frame_draw_bgr,
+            frame_idx=frame_idx,
+            surface_roi_mask=surface_roi_mask,
+            analysis_roi_mask=analysis_roi_mask,
+            image_processor=self.line_segformer_processor,
+        )
+
+    def run_unet_surface_on_frame(self, frame_infer_bgr, frame_draw_bgr, frame_idx, analysis_roi_mask=None):
+        return self._run_surface_segmentation_on_frame(
+            model=self.unet_model,
+            device=self.unet_device,
+            img_size=self.unet_img_size,
+            num_classes=self.unet_num_classes,
+            class_names=self.unet_names,
+            min_area=self.unet_min_area,
+            frame_infer_bgr=frame_infer_bgr,
+            frame_draw_bgr=frame_draw_bgr,
+            frame_idx=frame_idx,
+            analysis_roi_mask=analysis_roi_mask,
+        )
+
+    def run_deeplab_surface_on_frame(self, frame_infer_bgr, frame_draw_bgr, frame_idx, analysis_roi_mask=None):
+        return self._run_surface_segmentation_on_frame(
+            model=self.surface_deeplab_model,
+            device=self.deeplab_device,
+            img_size=self.deeplab_img_size,
+            num_classes=self.deeplab_num_classes,
+            class_names=self.deeplab_names,
+            min_area=self.deeplab_min_area,
+            frame_infer_bgr=frame_infer_bgr,
+            frame_draw_bgr=frame_draw_bgr,
+            frame_idx=frame_idx,
+            analysis_roi_mask=analysis_roi_mask,
+        )
+
+
+    def run_segformer_surface_on_frame(self, frame_infer_bgr, frame_draw_bgr, frame_idx, analysis_roi_mask=None):
+        return self._run_surface_segmentation_on_frame(
+            model=self.surface_segformer_model,
+            device=self.segformer_device,
+            img_size=0,
+            num_classes=self.segformer_num_classes,
+            class_names=self.segformer_names,
+            min_area=self.segformer_min_area,
+            frame_infer_bgr=frame_infer_bgr,
+            frame_draw_bgr=frame_draw_bgr,
+            frame_idx=frame_idx,
+            analysis_roi_mask=analysis_roi_mask,
+            image_processor=self.surface_segformer_processor,
+        )
+
+    def _run_hailo_surface_on_frame(self, model, frame_infer_bgr, frame_draw_bgr, frame_idx, analysis_roi_mask=None):
+        if model is None:
+            self.last_surface_roi = None
+            return frame_draw_bgr
+
+        detections = model.infer(frame_infer_bgr, conf_thres=self.conf_value)
+        self._merge_hailo_model_profile(model)
+        if not detections:
+            self.last_surface_roi = None
+            return frame_draw_bgr
+
+        overlay_surface = frame_draw_bgr.copy()
+        surface_roi = np.zeros(frame_draw_bgr.shape[:2], dtype=np.uint8)
+
+        for det in detections:
+            cls_id = int(det.get("class_id", 0))
+            class_name = str(det.get("class_name", cls_id))
+            conf = float(det.get("score", 0.0))
+            color = self.get_surface_color_by_name(class_name, cls_id)
+            mask = det.get("mask")
+            if mask is None:
+                continue
+            mask = mask.astype(bool)
+            if analysis_roi_mask is not None:
+                mask = mask & analysis_roi_mask.astype(bool)
+            if not mask.any():
+                continue
+
+            surface_roi[mask] = 1
+            self.observe_surface_candidate(class_name, int(mask.sum()))
+
+            for c in range(3):
+                overlay_surface[:, :, c][mask] = color[c]
+
+            reg_mask = (mask.astype(np.uint8) * 255)
+            t_contours = time.perf_counter()
+            contours, _ = cv2.findContours(reg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            self._add_profile_frame_ms("hailo_contours_ms", (time.perf_counter() - t_contours) * 1000.0)
+            if not contours:
+                continue
+
+            biggest = max(contours, key=cv2.contourArea)
+            t_draw = time.perf_counter()
+            cv2.drawContours(frame_draw_bgr, [biggest], -1, color, 2)
+            self._add_profile_frame_ms("hailo_contour_draw_ms", (time.perf_counter() - t_draw) * 1000.0)
+
+            M = cv2.moments(biggest)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                translated_name = self.translate_class_name(class_name)
+                label = f"{translated_name}: {conf:.2%}"
+                t_label = time.perf_counter()
+                cv2.putText(
+                    frame_draw_bgr,
+                    label,
+                    (cx, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2
+                )
+                self._add_profile_frame_ms("hailo_label_draw_ms", (time.perf_counter() - t_label) * 1000.0)
+
+            x, y, w_box, h_box = cv2.boundingRect(biggest)
+            bbox = (x, y, x + w_box, y + h_box)
+            self.register_confirmed_candidate(frame_idx, "surface", class_name, conf, bbox)
+
+        frame_draw_bgr = cv2.addWeighted(overlay_surface, 0.4, frame_draw_bgr, 0.6, 0)
+        self.last_surface_roi = surface_roi if surface_roi.any() else None
+        return frame_draw_bgr
+
+    def _run_hailo_line_on_frame(
+        self,
+        model,
+        frame_infer_bgr,
+        frame_draw_bgr,
+        frame_idx,
+        surface_roi_mask=None,
+        analysis_roi_mask=None,
+    ):
+        if model is None:
+            return frame_draw_bgr
+
+        detections = model.infer(frame_infer_bgr, conf_thres=self.conf_value)
+        self._merge_hailo_model_profile(model)
+        if not detections:
+            return frame_draw_bgr
+
+        overlay_line = frame_draw_bgr.copy()
+
+        if analysis_roi_mask is not None and surface_roi_mask is not None:
+            line_roi = (analysis_roi_mask.astype(bool) & surface_roi_mask.astype(bool))
+        elif analysis_roi_mask is not None:
+            line_roi = analysis_roi_mask.astype(bool)
+        elif surface_roi_mask is not None:
+            line_roi = surface_roi_mask.astype(bool)
+        else:
+            line_roi = None
+
+        for det in detections:
+            cls_id = int(det.get("class_id", 0))
+            class_name = str(det.get("class_name", cls_id))
+            conf = float(det.get("score", 0.0))
+            color = self.get_line_color_by_name(class_name)
+            mask = det.get("mask")
+            if mask is None:
+                continue
+            mask = mask.astype(bool)
+            if line_roi is not None:
+                mask = mask & line_roi
+            if not mask.any():
+                continue
+
+            for c in range(3):
+                overlay_line[:, :, c][mask] = color[c]
+
+            reg_mask = (mask.astype(np.uint8) * 255)
+            t_contours = time.perf_counter()
+            contours, _ = cv2.findContours(reg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            self._add_profile_frame_ms("hailo_contours_ms", (time.perf_counter() - t_contours) * 1000.0)
+            if not contours:
+                continue
+
+            biggest = max(contours, key=cv2.contourArea)
+            t_draw = time.perf_counter()
+            cv2.drawContours(frame_draw_bgr, [biggest], -1, color, 2)
+            self._add_profile_frame_ms("hailo_contour_draw_ms", (time.perf_counter() - t_draw) * 1000.0)
+
+            M = cv2.moments(biggest)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                translated_name = self.translate_class_name(class_name)
+                label = f"{translated_name}: {conf:.2%}"
+                t_label = time.perf_counter()
+                cv2.putText(
+                    frame_draw_bgr,
+                    label,
+                    (cx, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2
+                )
+
+            x, y, w_box, h_box = cv2.boundingRect(biggest)
+            bbox = (x, y, x + w_box, y + h_box)
+            self.register_confirmed_candidate(frame_idx, "line", class_name, conf, bbox)
+            self.observe_line_candidate(class_name)
+
+        frame_draw_bgr = cv2.addWeighted(overlay_line, 0.4, frame_draw_bgr, 0.6, 0)
+        return frame_draw_bgr
+
     def run_detection_on_frame(self, frame, frame_idx):
+        self.begin_frame_event_scan()
+
         frame_vis = frame.copy()
         height, width = frame.shape[:2]
 
@@ -394,7 +1080,8 @@ class DetectionMixin:
 
         self.last_surface_roi = None
 
-        if self.surface_backend_var.get() == "YOLO":
+        surface_backend = self.surface_backend_var.get()
+        if surface_backend == "YOLO":
             if self.surface_model is not None:
                 overlay_surface = frame_vis.copy()
                 surface_roi = np.zeros((height, width), dtype=np.uint8)
@@ -426,6 +1113,7 @@ class DetectionMixin:
                                     continue
 
                             surface_roi[mask_resized > 0] = 1
+                            self.observe_surface_candidate(class_name, int((mask_resized > 0).sum()))
 
                             for c in range(3):
                                 overlay_surface[:, :, c][mask_resized > 0] = color[c]
@@ -485,6 +1173,7 @@ class DetectionMixin:
                                 continue
 
                             surface_roi[y1c:y2c, x1c:x2c] = 1
+                            self.observe_surface_candidate(class_name, (x2c - x1c) * (y2c - y1c))
                             cv2.rectangle(frame_vis, (x1c, y1c), (x2c, y2c), color, 2)
 
                             translated_name = self.translate_class_name(class_name)
@@ -505,15 +1194,38 @@ class DetectionMixin:
                 frame_vis = cv2.addWeighted(overlay_surface, 0.4, frame_vis, 0.6, 0)
                 self.last_surface_roi = surface_roi if surface_roi.any() else None
 
-        else:
+        elif surface_backend == "HAILO":
+            frame_vis = self._run_hailo_surface_on_frame(
+                self.surface_hailo_model,
+                frame_for_models,
+                frame_vis,
+                frame_idx,
+                analysis_roi_mask=analysis_roi
+            )
+        elif surface_backend == "UNET":
             frame_vis = self.run_unet_surface_on_frame(
                 frame_for_models,
                 frame_vis,
                 frame_idx,
                 analysis_roi_mask=analysis_roi
             )
+        elif surface_backend == "DEEPLABV3":
+            frame_vis = self.run_deeplab_surface_on_frame(
+                frame_for_models,
+                frame_vis,
+                frame_idx,
+                analysis_roi_mask=analysis_roi
+            )
+        else:
+            frame_vis = self.run_segformer_surface_on_frame(
+                frame_for_models,
+                frame_vis,
+                frame_idx,
+                analysis_roi_mask=analysis_roi
+            )
 
-        if self.line_backend_var.get() == "YOLO":
+        line_backend = self.line_backend_var.get()
+        if line_backend == "YOLO":
             if self.line_model is not None:
                 overlay_line = frame_vis.copy()
                 results_line = self.line_model(
@@ -606,6 +1318,7 @@ class DetectionMixin:
                             bbox = (x, y, x + w_box, y + h_box)
                             conf_best = class_best_conf.get(cls_id, 0.0)
                             self.register_confirmed_candidate(frame_idx, "line", class_name, conf_best, bbox)
+                            self.observe_line_candidate(class_name)
 
                     else:
                         if r.boxes is None:
@@ -649,10 +1362,21 @@ class DetectionMixin:
 
                             bbox = (x1c, y1c, x2c, y2c)
                             self.register_confirmed_candidate(frame_idx, "line", class_name, conf, bbox)
+                            self.observe_line_candidate(class_name)
 
                 frame_vis = cv2.addWeighted(overlay_line, 0.4, frame_vis, 0.6, 0)
 
-        else:
+        elif line_backend == "HAILO":
+            surface_roi = self.last_surface_roi if self.surface_ready() else None
+            frame_vis = self._run_hailo_line_on_frame(
+                self.line_hailo_model,
+                frame_for_models,
+                frame_vis,
+                frame_idx,
+                surface_roi_mask=surface_roi,
+                analysis_roi_mask=analysis_roi
+            )
+        elif line_backend == "UNET":
             surface_roi = self.last_surface_roi if self.surface_ready() else None
             frame_vis = self.run_unet_line_on_frame(
                 frame_for_models,
@@ -661,7 +1385,26 @@ class DetectionMixin:
                 surface_roi_mask=surface_roi,
                 analysis_roi_mask=analysis_roi
             )
+        elif line_backend == "DEEPLABV3":
+            surface_roi = self.last_surface_roi if self.surface_ready() else None
+            frame_vis = self.run_deeplab_line_on_frame(
+                frame_for_models,
+                frame_vis,
+                frame_idx,
+                surface_roi_mask=surface_roi,
+                analysis_roi_mask=analysis_roi
+            )
+        else:
+            surface_roi = self.last_surface_roi if self.surface_ready() else None
+            frame_vis = self.run_segformer_line_on_frame(
+                frame_for_models,
+                frame_vis,
+                frame_idx,
+                surface_roi_mask=surface_roi,
+                analysis_roi_mask=analysis_roi
+            )
 
+        self.finalize_frame_event_scan()
         frame_vis = self.draw_roi_boundary(frame_vis, roi_y)
         return frame_vis
     pass

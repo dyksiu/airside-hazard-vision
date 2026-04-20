@@ -156,7 +156,6 @@ class YoloVideoApp(
         ], dtype=np.uint8)
 
         self.last_surface_roi = None
-        self.display_surface_roi = None
         self.surface_roi_dilate = 15
         
         self.surface_update_stride = 3
@@ -212,6 +211,11 @@ class YoloVideoApp(
         self.pause_event = threading.Event()
         self.paused = False
 
+        self.benchmark_mode = False
+        self.benchmark_headless = False
+        self.benchmark_display_stride = 4
+        self.show_runtime_overlay = True
+
         self.lang = "pl"
         self.translations = TRANSLATIONS
         self.class_name_translations = CLASS_NAME_TRANSLATIONS
@@ -241,11 +245,6 @@ class YoloVideoApp(
         self.frame_count = 0
         self.current_fps = 0.0
         self.avg_fps = 0.0
-        self.input_fps = 0.0
-        self.inference_fps = 0.0
-        self.detection_fps = 0.0
-        self.display_fps = 0.0
-        self.avg_infer_ms = 0.0
         self.process_stride = 1
         self.conf_value = 0.25
 
@@ -444,6 +443,14 @@ class YoloVideoApp(
         )
         self.pause_button.pack(pady=5)
 
+        self.overlay_button = Button(
+            self.controls,
+            text=self._get_overlay_button_text(),
+            command=self.toggle_runtime_overlay,
+            **self._btn_style()
+        )
+        self.overlay_button.pack(pady=(0, 5))
+
         sep2 = Frame(self.controls, bg=self.bg_separator, height=2, width=420)
         sep2.pack(pady=12)
         sep2.pack_propagate(False)
@@ -514,6 +521,37 @@ class YoloVideoApp(
         self.event_log_scroll.pack(side="right", fill="y")
         self.event_log_text.configure(yscrollcommand=self.event_log_scroll.set)
 
+    def _get_benchmark_button_text(self):
+        if self.benchmark_headless:
+            mode = self.tr("benchmark_headless")
+        elif self.benchmark_mode:
+            mode = self.tr("benchmark_gui")
+        else:
+            mode = self.tr("benchmark_off")
+        return f"{self.tr('benchmark_button')}: {mode}"
+
+    def toggle_benchmark_mode(self):
+        if self.running:
+            return
+        if not self.benchmark_mode and not self.benchmark_headless:
+            self.benchmark_mode = True
+            self.benchmark_headless = False
+        elif self.benchmark_mode and not self.benchmark_headless:
+            self.benchmark_mode = False
+            self.benchmark_headless = True
+        else:
+            self.benchmark_mode = False
+            self.benchmark_headless = False
+
+    def _get_overlay_button_text(self):
+        state = self.tr("overlay_on") if getattr(self, "show_runtime_overlay", True) else self.tr("overlay_off")
+        return f"{self.tr('overlay_button')}: {state}"
+
+    def toggle_runtime_overlay(self):
+        self.show_runtime_overlay = not getattr(self, "show_runtime_overlay", True)
+        if hasattr(self, "overlay_button"):
+            self.overlay_button.config(text=self._get_overlay_button_text())
+
     def tr(self, key):
         return self.translations[self.lang].get(key, key)
 
@@ -534,6 +572,8 @@ class YoloVideoApp(
         self.lang_button.config(text=self.tr("lang_toggle"))
         self.results_button.config(text=self.tr("analysis_results"))
         self.pause_button.config(text=self.tr("resume") if self.paused else self.tr("pause"))
+        if hasattr(self, "overlay_button"):
+            self.overlay_button.config(text=self._get_overlay_button_text())
         self.surface_clear_button.config(text=self.tr("clear_model"))
         self.line_clear_button.config(text=self.tr("clear_model"))
         self.event_log_label.config(text=self.tr("event_log"))
@@ -752,7 +792,6 @@ class YoloVideoApp(
         self.red_line_miss_frames = 0
         self.cached_surface_name = None
         self.cached_surface_area = 0.0
-        self.display_surface_roi = None
         self.begin_frame_event_scan()
 
         while True:
@@ -773,11 +812,6 @@ class YoloVideoApp(
             detections_copy = list(self.detections)
             current_fps_copy = float(self.current_fps)
             avg_fps_copy = float(self.avg_fps)
-            input_fps_copy = float(self.input_fps)
-            inference_fps_copy = float(self.inference_fps)
-            detection_fps_copy = float(self.detection_fps)
-            display_fps_copy = float(self.display_fps)
-            avg_infer_ms_copy = float(self.avg_infer_ms)
 
         event_log_copy = list(self.event_log_entries)
 
@@ -833,11 +867,6 @@ class YoloVideoApp(
                 detections_copy=detections_copy,
                 current_fps=current_fps_copy,
                 avg_fps=avg_fps_copy,
-                input_fps=input_fps_copy,
-                inference_fps=inference_fps_copy,
-                detection_fps=detection_fps_copy,
-                display_fps=display_fps_copy,
-                avg_infer_ms=avg_infer_ms_copy,
                 event_log_copy=event_log_copy,
             )
             messagebox.showinfo(self.tr("saved"), self.tr("saved_msg").format(save_path))

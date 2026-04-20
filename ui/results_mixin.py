@@ -5,7 +5,6 @@ from matplotlib.figure import Figure
 
 
 class ResultsMixin:
-   
     def open_results_window(self):
         if self.results_win is not None and self.results_win.winfo_exists():
             self.results_win.lift()
@@ -63,10 +62,26 @@ class ResultsMixin:
     def _tick_results_update(self):
         if self.results_win is None or not self.results_win.winfo_exists():
             return
-        self.update_results_window()
-        self.schedule_results_update()
+        try:
+            self.update_results_window()
+        finally:
+            self.schedule_results_update()
 
-  
+    def _normalize_runtime(self):
+        runtime = self.copy_runtime_stats()
+        if isinstance(runtime, dict):
+            return runtime
+        fc, current_fps, avg_fps = runtime
+        return {
+            "frame_count": fc,
+            "current_fps": current_fps,
+            "avg_fps": avg_fps,
+            "inference_fps": current_fps,
+            "detection_fps": avg_fps,
+            "display_fps": 0.0,
+            "avg_infer_ms": 0.0,
+        }
+
     def update_results_window(self):
         if self.results_win is None or not self.results_win.winfo_exists() or self.results_tree is None:
             return
@@ -79,18 +94,32 @@ class ResultsMixin:
         for item in self.results_tree.get_children():
             self.results_tree.delete(item)
 
-        stats, fc = self.copy_stats()
-        if not stats:
-            if self.results_info:
-                self.results_info.config(text=self.tr("no_stats"))
-            return
+        stats, _ = self.copy_stats()
+        runtime = self._normalize_runtime()
+        fc = int(runtime.get("frame_count", 0))
 
         total_det = sum(v["count"] for v in stats.values())
         if self.results_info:
-            self.results_info.config(
-                text=f"Klatka: {fc} | Wykrycia: {total_det}" if self.lang == "pl"
-                else f"Frame: {fc} | Detections: {total_det}"
-            )
+            if self.lang == "pl":
+                info_text = (
+                    f"Klatka: {fc} | Wykrycia: {total_det}\n"
+                    f"{self.tr('fps_inference')}: {runtime.get('inference_fps', 0.0):.1f} | "
+                    f"{self.tr('fps_detection')}: {runtime.get('detection_fps', 0.0):.1f} | "
+                    f"{self.tr('fps_display')}: {runtime.get('display_fps', 0.0):.1f} | "
+                    f"{self.tr('infer_time_avg')}: {runtime.get('avg_infer_ms', 0.0):.1f} ms"
+                )
+            else:
+                info_text = (
+                    f"Frame: {fc} | Detections: {total_det}\n"
+                    f"{self.tr('fps_inference')}: {runtime.get('inference_fps', 0.0):.1f} | "
+                    f"{self.tr('fps_detection')}: {runtime.get('detection_fps', 0.0):.1f} | "
+                    f"{self.tr('fps_display')}: {runtime.get('display_fps', 0.0):.1f} | "
+                    f"{self.tr('infer_time_avg')}: {runtime.get('avg_infer_ms', 0.0):.1f} ms"
+                )
+            self.results_info.config(text=info_text)
+
+        if not stats:
+            return
 
         rows = []
         for key, st in stats.items():
@@ -183,4 +212,3 @@ class ResultsMixin:
 
         self.hist_fig.tight_layout()
         self.hist_canvas.draw()
-    pass
