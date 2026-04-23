@@ -212,9 +212,8 @@ class YoloVideoApp(
         self.paused = False
 
         self.benchmark_mode = False
-        self.benchmark_headless = False
         self.benchmark_display_stride = 4
-        self.show_runtime_overlay = True
+        self.show_runtime_overlay = False
 
         self.lang = "pl"
         self.translations = TRANSLATIONS
@@ -451,6 +450,14 @@ class YoloVideoApp(
         )
         self.overlay_button.pack(pady=(0, 5))
 
+        self.benchmark_button = Button(
+            self.controls,
+            text=self._get_benchmark_button_text(),
+            command=self.toggle_benchmark_mode,
+            **self._btn_style()
+        )
+        self.benchmark_button.pack(pady=(0, 5))
+
         sep2 = Frame(self.controls, bg=self.bg_separator, height=2, width=420)
         sep2.pack(pady=12)
         sep2.pack_propagate(False)
@@ -521,36 +528,25 @@ class YoloVideoApp(
         self.event_log_scroll.pack(side="right", fill="y")
         self.event_log_text.configure(yscrollcommand=self.event_log_scroll.set)
 
+    def _get_overlay_button_text(self):
+        state = self.tr("overlay_on") if self.show_runtime_overlay else self.tr("overlay_off")
+        return f"{self.tr('overlay_button')}: {state}"
+
+    def toggle_runtime_overlay(self):
+        self.show_runtime_overlay = not self.show_runtime_overlay
+        if hasattr(self, "overlay_button"):
+            self.overlay_button.config(text=self._get_overlay_button_text())
+
     def _get_benchmark_button_text(self):
-        if self.benchmark_headless:
-            mode = self.tr("benchmark_headless")
-        elif self.benchmark_mode:
-            mode = self.tr("benchmark_gui")
-        else:
-            mode = self.tr("benchmark_off")
+        mode = self.tr("benchmark_gui") if self.benchmark_mode else self.tr("benchmark_off")
         return f"{self.tr('benchmark_button')}: {mode}"
 
     def toggle_benchmark_mode(self):
         if self.running:
             return
-        if not self.benchmark_mode and not self.benchmark_headless:
-            self.benchmark_mode = True
-            self.benchmark_headless = False
-        elif self.benchmark_mode and not self.benchmark_headless:
-            self.benchmark_mode = False
-            self.benchmark_headless = True
-        else:
-            self.benchmark_mode = False
-            self.benchmark_headless = False
-
-    def _get_overlay_button_text(self):
-        state = self.tr("overlay_on") if getattr(self, "show_runtime_overlay", True) else self.tr("overlay_off")
-        return f"{self.tr('overlay_button')}: {state}"
-
-    def toggle_runtime_overlay(self):
-        self.show_runtime_overlay = not getattr(self, "show_runtime_overlay", True)
-        if hasattr(self, "overlay_button"):
-            self.overlay_button.config(text=self._get_overlay_button_text())
+        self.benchmark_mode = not self.benchmark_mode
+        if hasattr(self, "benchmark_button"):
+            self.benchmark_button.config(text=self._get_benchmark_button_text())
 
     def tr(self, key):
         return self.translations[self.lang].get(key, key)
@@ -574,6 +570,8 @@ class YoloVideoApp(
         self.pause_button.config(text=self.tr("resume") if self.paused else self.tr("pause"))
         if hasattr(self, "overlay_button"):
             self.overlay_button.config(text=self._get_overlay_button_text())
+        if hasattr(self, "benchmark_button"):
+            self.benchmark_button.config(text=self._get_benchmark_button_text())
         self.surface_clear_button.config(text=self.tr("clear_model"))
         self.line_clear_button.config(text=self.tr("clear_model"))
         self.event_log_label.config(text=self.tr("event_log"))
@@ -803,6 +801,32 @@ class YoloVideoApp(
         self.event_log_entries = []
         self.render_event_log()
 
+    def _current_surface_model_label(self, backend):
+        if backend == "YOLO":
+            return self.surface_yolo_name or self.tr("no_model")
+        if backend == "HAILO":
+            return self.surface_hailo_name or self.tr("no_model")
+        if backend == "UNET":
+            return self.surface_unet_name or self.tr("no_model")
+        if backend == "DEEPLABV3":
+            if self.surface_deeplab_name and self.surface_deeplab_arch:
+                return f"{self.surface_deeplab_name} ({self.surface_deeplab_arch})"
+            return self.surface_deeplab_name or self.tr("no_model")
+        return self.surface_segformer_name or self.tr("no_model")
+
+    def _current_line_model_label(self, backend):
+        if backend == "YOLO":
+            return self.line_yolo_name or self.tr("no_model")
+        if backend == "HAILO":
+            return self.line_hailo_name or self.tr("no_model")
+        if backend == "UNET":
+            return self.line_unet_name or self.tr("no_model")
+        if backend == "DEEPLABV3":
+            if self.line_deeplab_name and self.line_deeplab_arch:
+                return f"{self.line_deeplab_name} ({self.line_deeplab_arch})"
+            return self.line_deeplab_name or self.tr("no_model")
+        return self.line_segformer_name or self.tr("no_model")
+
     def save_csv(self):
         from tkinter import filedialog, messagebox
 
@@ -850,6 +874,21 @@ class YoloVideoApp(
                 line_num_classes = self.line_unet_num_classes
                 line_names = self.line_unet_names
 
+            runtime_stats = self.copy_runtime_stats()
+            stage_profile_avg, stage_profile_last = self.copy_stage_profile_stats()
+            run_info = {
+                "benchmark_mode": "gui" if self.benchmark_mode else "off",
+                "benchmark_display_stride": int(getattr(self, "benchmark_display_stride", 1)),
+                "runtime_overlay_enabled": bool(getattr(self, "show_runtime_overlay", False)),
+                "surface_backend": surface_backend,
+                "line_backend": line_backend,
+                "surface_model_name": self._current_surface_model_label(surface_backend),
+                "line_model_name": self._current_line_model_label(line_backend),
+                "process_stride": int(getattr(self, "process_stride", 1)),
+                "confidence_threshold": float(getattr(self, "conf_value", self.conf_slider.get() / 100)),
+                "video_source": getattr(self, "last_video_path", ""),
+            }
+
             surface_model_for_export = self.surface_hailo_model if surface_backend == "HAILO" else self.surface_model
             line_model_for_export = self.line_hailo_model if line_backend == "HAILO" else self.line_model
 
@@ -868,6 +907,10 @@ class YoloVideoApp(
                 current_fps=current_fps_copy,
                 avg_fps=avg_fps_copy,
                 event_log_copy=event_log_copy,
+                runtime_stats=runtime_stats,
+                stage_profile_avg=stage_profile_avg,
+                stage_profile_last=stage_profile_last,
+                run_info=run_info,
             )
             messagebox.showinfo(self.tr("saved"), self.tr("saved_msg").format(save_path))
         except Exception as e:

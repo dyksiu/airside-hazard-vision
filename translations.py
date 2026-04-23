@@ -53,8 +53,15 @@ TRANSLATIONS = {
         "fps_average": "srednie FPS",
         "fps_inference": "FPS inferencji",
         "fps_detection": "FPS detekcji",
-        "fps_display": "FPS podgladu",
+        "fps_display": "FPS wyswietlania",
         "infer_time_avg": "Sr. czas inferencji",
+        "overlay_button": "Parametry",
+        "overlay_on": "WŁ.",
+        "overlay_off": "WYŁ.",
+        "benchmark_button": "Benchmark",
+        "benchmark_off": "WYŁ.",
+        "benchmark_gui": "GUI",
+        "benchmark_badge": "Benchmark",
     },
     "en": {
         "select_model": "Select models",
@@ -112,6 +119,13 @@ TRANSLATIONS = {
         "fps_detection": "Detection FPS",
         "fps_display": "Display FPS",
         "infer_time_avg": "Avg inference time",
+        "overlay_button": "Parameters",
+        "overlay_on": "ON",
+        "overlay_off": "OFF",
+        "benchmark_button": "Benchmark",
+        "benchmark_off": "OFF",
+        "benchmark_gui": "GUI",
+        "benchmark_badge": "Benchmark",
     }
 }
 
