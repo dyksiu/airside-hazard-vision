@@ -5,10 +5,10 @@ import numpy as np
 import torch
 
 from tkinter import (
-    Label, Button, Scale, HORIZONTAL, Frame, Text
+    Label, Button, Scale, HORIZONTAL, Frame, Text, Checkbutton
 )
 from tkinter import ttk
-from tkinter import StringVar
+from tkinter import StringVar, BooleanVar
 
 from ui.translations import TRANSLATIONS, CLASS_NAME_TRANSLATIONS
 from ui.results_mixin import ResultsMixin
@@ -84,6 +84,8 @@ class YoloVideoApp(
 
         self.line_backend_var = StringVar(value="YOLO")
         self.surface_backend_var = StringVar(value="YOLO")
+        self.show_fps_var = BooleanVar(value=True)
+        self.show_fps_overlay_enabled = True
 
         self.line_yolo_name = None
         self.line_unet_name = None
@@ -428,6 +430,20 @@ class YoloVideoApp(
         )
         self.pause_button.pack(pady=5)
 
+        self.fps_check = Checkbutton(
+            self.controls,
+            text=self.tr("show_fps"),
+            variable=self.show_fps_var,
+            command=self.on_fps_toggle,
+            bg=self.bg_main,
+            fg=self.fg_main,
+            activebackground=self.bg_main,
+            activeforeground=self.fg_main,
+            selectcolor=self.bg_panel,
+            highlightbackground=self.bg_main
+        )
+        self.fps_check.pack(pady=(0, 5))
+
         sep2 = Frame(self.controls, bg=self.bg_separator, height=2, width=420)
         sep2.pack(pady=12)
         sep2.pack_propagate(False)
@@ -508,6 +524,9 @@ class YoloVideoApp(
     def translate_class_name(self, name):
         return self.class_name_translations.get(self.lang, {}).get(name, name)
 
+    def on_fps_toggle(self):
+        self.show_fps_overlay_enabled = bool(self.show_fps_var.get())
+
     def update_labels(self):
         self.model_label.config(text=self.tr("select_model"))
         self.video_label.config(text=self.tr("select_video_conf"))
@@ -518,6 +537,7 @@ class YoloVideoApp(
         self.lang_button.config(text=self.tr("lang_toggle"))
         self.results_button.config(text=self.tr("analysis_results"))
         self.pause_button.config(text=self.tr("resume") if self.paused else self.tr("pause"))
+        self.fps_check.config(text=self.tr("show_fps"))
         self.surface_clear_button.config(text=self.tr("clear_model"))
         self.line_clear_button.config(text=self.tr("clear_model"))
         self.event_log_label.config(text=self.tr("event_log"))

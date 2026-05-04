@@ -200,7 +200,8 @@ class VideoMixin:
                     self.avg_fps = avg_fps
                     current_fps = self.current_fps
 
-                frame_vis = self.draw_fps_overlay(frame_vis, current_fps, avg_fps)
+                if getattr(self, "show_fps_overlay_enabled", True):
+                    frame_vis = self.draw_fps_overlay(frame_vis, current_fps, avg_fps)
 
                 try:
                     while True:

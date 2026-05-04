@@ -49,8 +49,9 @@ TRANSLATIONS = {
         "red_line_detected": "wykryto czerwoną linię",
         "video_placeholder": "(Podgląd pojawi się po kliknięciu „Wybierz wideo”)",
         "video_stopped": "(Zatrzymano)",
+        "show_fps": "Pokaż FPS",
         "fps_current": "Aktualne FPS",
-        "fps_average": "srednie FPS",
+        "fps_average": "średnie FPS",
     },
     "en": {
         "select_model": "Select models",
@@ -102,6 +103,7 @@ TRANSLATIONS = {
         "red_line_detected": "red line detected",
         "video_placeholder": "(Preview will appear after clicking \"Choose video\")",
         "video_stopped": "(Stopped)",
+        "show_fps": "Show FPS",
         "fps_current": "Current FPS",
         "fps_average": "Average FPS",
     }
