@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from tkinter import (
-    Label, Button, Scale, HORIZONTAL, Frame, Text, Checkbutton
+    Label, Button, Scale, HORIZONTAL, Frame, Text
 )
 from tkinter import ttk
 from tkinter import StringVar, BooleanVar
@@ -84,8 +84,11 @@ class YoloVideoApp(
 
         self.line_backend_var = StringVar(value="YOLO")
         self.surface_backend_var = StringVar(value="YOLO")
-        self.show_fps_var = BooleanVar(value=True)
-        self.show_fps_overlay_enabled = True
+        self.show_fps_var = BooleanVar(value=False)
+        self.show_fps_overlay_enabled = False
+        self.conf_value = 0.25
+        self.roi_value = 0
+        self._processing_controls_locked = False
 
         self.line_yolo_name = None
         self.line_unet_name = None
@@ -197,6 +200,10 @@ class YoloVideoApp(
         self.worker_thread = None
         self.worker_done = False
         self.worker_error = None
+        self.worker_error_log_path = None
+        self._pending_clear_video = False
+        self._stop_requested_by_user = False
+        self._stopping = False
         self.display_job = None
         self.display_delay_ms = 33
 
@@ -234,6 +241,7 @@ class YoloVideoApp(
         self.avg_fps = 0.0
         self.process_stride = 1
         self.conf_value = 0.25
+        self.roi_value = int(self.roi_slider.get()) if hasattr(self, "roi_slider") else 0
 
         self.window.bind("<KeyPress-q>", lambda e: self.stop_processing())
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -430,20 +438,6 @@ class YoloVideoApp(
         )
         self.pause_button.pack(pady=5)
 
-        self.fps_check = Checkbutton(
-            self.controls,
-            text=self.tr("show_fps"),
-            variable=self.show_fps_var,
-            command=self.on_fps_toggle,
-            bg=self.bg_main,
-            fg=self.fg_main,
-            activebackground=self.bg_main,
-            activeforeground=self.fg_main,
-            selectcolor=self.bg_panel,
-            highlightbackground=self.bg_main
-        )
-        self.fps_check.pack(pady=(0, 5))
-
         sep2 = Frame(self.controls, bg=self.bg_separator, height=2, width=420)
         sep2.pack(pady=12)
         sep2.pack_propagate(False)
@@ -527,6 +521,40 @@ class YoloVideoApp(
     def on_fps_toggle(self):
         self.show_fps_overlay_enabled = bool(self.show_fps_var.get())
 
+    def set_processing_controls_state(self, processing):
+        # Blokada zmiany modeli w tle dzialania programu
+        # ROI i confidence mozna zmieniac
+        self._processing_controls_locked = bool(processing)
+        button_state = "disabled" if processing else "normal"
+        combo_state = "disabled" if processing else "readonly"
+
+        widgets_and_states = [
+            (getattr(self, "surface_model_button", None), button_state),
+            (getattr(self, "surface_clear_button", None), button_state),
+            (getattr(self, "line_model_button", None), button_state),
+            (getattr(self, "line_clear_button", None), button_state),
+            (getattr(self, "video_button", None), button_state),
+            (getattr(self, "surface_backend_combo", None), combo_state),
+            (getattr(self, "line_backend_combo", None), combo_state),
+        ]
+
+        for widget, state in widgets_and_states:
+            if widget is None:
+                continue
+            try:
+                widget.config(state=state)
+            except Exception:
+                pass
+
+
+        for widget in (getattr(self, "conf_slider", None), getattr(self, "roi_slider", None)):
+            if widget is None:
+                continue
+            try:
+                widget.config(state="normal")
+            except Exception:
+                pass
+
     def update_labels(self):
         self.model_label.config(text=self.tr("select_model"))
         self.video_label.config(text=self.tr("select_video_conf"))
@@ -537,7 +565,6 @@ class YoloVideoApp(
         self.lang_button.config(text=self.tr("lang_toggle"))
         self.results_button.config(text=self.tr("analysis_results"))
         self.pause_button.config(text=self.tr("resume") if self.paused else self.tr("pause"))
-        self.fps_check.config(text=self.tr("show_fps"))
         self.surface_clear_button.config(text=self.tr("clear_model"))
         self.line_clear_button.config(text=self.tr("clear_model"))
         self.event_log_label.config(text=self.tr("event_log"))
@@ -553,12 +580,21 @@ class YoloVideoApp(
 
         self.on_surface_backend_changed()
         self.on_line_backend_changed()
+        self.set_processing_controls_state(self.running)
 
     def update_conf_label(self, val):
-        self.conf_label.config(text=f"{self.tr('confidence')}: {int(float(val)) / 100:.2f}")
+        try:
+            self.conf_value = int(float(val)) / 100
+        except Exception:
+            self.conf_value = 0.25
+        self.conf_label.config(text=f"{self.tr('confidence')}: {self.conf_value:.2f}")
 
     def update_roi_label(self, val):
-        pct = int(float(val))
+        try:
+            pct = int(float(val))
+        except Exception:
+            pct = 0
+        self.roi_value = pct
         if pct <= 0:
             txt = f"{self.tr('roi_limit')}: 0% ({self.tr('roi_off')})"
         else:

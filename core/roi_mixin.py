@@ -4,7 +4,14 @@ import numpy as np
 
 class RoiMixin:
     def get_analysis_roi_mask(self, height, width):
-        pct = int(self.roi_slider.get()) if hasattr(self, "roi_slider") else 0
+        # Nie odczytujemy wartości bezpośrednio z widgetu Tkintera w wątku roboczym.
+        # Aktualna wartość jest zapisywana w self.roi_value przez update_roi_label()
+        # w głównym wątku GUI.
+        try:
+            pct = int(getattr(self, "roi_value", 0) or 0)
+        except Exception:
+            pct = 0
+
         if pct <= 0:
             return None, None
 

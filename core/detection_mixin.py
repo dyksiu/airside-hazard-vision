@@ -270,6 +270,10 @@ class DetectionMixin:
         )
 
     def select_surface_model(self):
+        if self.running:
+            messagebox.showwarning(self.tr("processing_locked_title"), self.tr("processing_locked_msg"))
+            return
+
         backend = self.surface_backend_var.get()
         if backend == "YOLO":
             model_path = filedialog.askopenfilename(filetypes=[("YOLO model files", "*.pt")])
@@ -330,6 +334,10 @@ class DetectionMixin:
                 messagebox.showerror(self.tr("model_error"), self.tr("model_error_msg").format(e))
 
     def select_line_model(self):
+        if self.running:
+            messagebox.showwarning(self.tr("processing_locked_title"), self.tr("processing_locked_msg"))
+            return
+
         backend = self.line_backend_var.get()
         if backend == "YOLO":
             model_path = filedialog.askopenfilename(filetypes=[("YOLO model files", "*.pt")])
@@ -391,7 +399,8 @@ class DetectionMixin:
 
     def clear_surface_model(self):
         if self.running:
-            self.stop_processing(silent=True)
+            messagebox.showwarning(self.tr("processing_locked_title"), self.tr("processing_locked_msg"))
+            return
 
         backend = self.surface_backend_var.get()
         cleared_name = None
@@ -434,7 +443,8 @@ class DetectionMixin:
 
     def clear_line_model(self):
         if self.running:
-            self.stop_processing(silent=True)
+            messagebox.showwarning(self.tr("processing_locked_title"), self.tr("processing_locked_msg"))
+            return
 
         backend = self.line_backend_var.get()
         cleared_name = None
