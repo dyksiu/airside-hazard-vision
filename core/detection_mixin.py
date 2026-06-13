@@ -18,8 +18,6 @@ class DetectionMixin:
             from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
         except ImportError as exc:
             raise ImportError(
-                "Brakuje biblioteki transformers wymaganej do obsługi SegFormer. "
-                "Zainstaluj: pip install transformers"
             ) from exc
         return SegformerForSemanticSegmentation, SegformerImageProcessor
 
